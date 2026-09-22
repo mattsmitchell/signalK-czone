@@ -1,0 +1,471 @@
+'use strict'
+
+const path = require('path')
+const fs = require('fs')
+const os = require('os')
+const {
+  parseRawLine,
+  createFastPacketReassembler,
+  decodeCzoneHeader
+} = require('./lib/nmea2000')
+
+const CURRENT_PGN_DC = 130822
+const CURRENT_PGN_AC = 130817
+const AC_CURRENT_SCALE = 0.2 // observed: raw 40 == 8.0 A on Water Heater Port
+const DC_CURRENT_SCALE = 0.1 // validated against existing DC/COI captures
+const RECORD_COUNT = 8
+const RECORD_SIZE = 3
+const CZONE_PAYLOAD_SIZE = 28
+const MAX_UPLOAD_BYTES = 1024 * 1024
+
+function hex2 (value) {
+  return Number(value).toString(16).padStart(2, '0')
+}
+
+function safeName (value) {
+  const text = String(value || 'CZoneCircuit').trim()
+  const cleaned = text
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return cleaned || 'CZoneCircuit'
+}
+
+function getConfig (config) {
+  const c = config && config.configuration ? config.configuration : (config || {})
+  return {
+    zcfPath: c.zcfPath || '',
+    logUnmapped: c.logUnmapped === true,
+    debugRaw: c.debugRaw === true
+  }
+}
+
+function safeFilename (value) {
+  const base = path.basename(String(value || 'CZone.zcf'))
+  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, '_')
+  if (!cleaned.toLowerCase().endsWith('.zcf')) return `${cleaned}.zcf`
+  return cleaned
+}
+
+function loadMapping (zcfPath) {
+  const zcf = require('./lib/zcf')
+
+  const loaders = ['loadZcf', 'parseZcf', 'load', 'parse']
+  for (const name of loaders) {
+    if (typeof zcf[name] === 'function') return zcf[name](zcfPath)
+  }
+  if (typeof zcf === 'function') return zcf(zcfPath)
+  if (zcf && typeof zcf.default === 'function') return zcf.default(zcfPath)
+  throw new Error('lib/zcf.js does not expose a ZCF loader (expected loadZcf/parseZcf/load/parse)')
+}
+
+function lookupMapping (zcf, mapping, module, page, slot, pgn) {
+  if (zcf && typeof zcf.lookup === 'function') return zcf.lookup(mapping, module, page, slot, pgn)
+  if (!mapping || !Array.isArray(mapping.currentMappings)) return null
+  return mapping.currentMappings.find(x =>
+    Number(x.module) === module &&
+    Number(x.page) === page &&
+    Number(x.slot) === slot &&
+    (pgn === undefined || Number(x.pgn) === pgn)
+  ) || null
+}
+
+function mappingName (entry) {
+  return entry && (entry.friendlyName || entry.name || entry.label || entry.circuitName)
+}
+
+function publishCurrent (app, entry, module, channel, current, pgn, source) {
+  const friendly = safeName(mappingName(entry))
+  const pathName = `electrical.czone.${friendly}.current`
+  app.handleMessage('signalk-czone', {
+    updates: [{
+      source: { label: 'CZone', src: source, pgn },
+      timestamp: new Date().toISOString(),
+      values: [{ path: pathName, value: current }]
+    }]
+  })
+  return pathName
+}
+
+function readRequestBody (req, maxBytes = MAX_UPLOAD_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    let settled = false
+    const fail = error => {
+      if (settled) return
+      settled = true
+      reject(error)
+      try { req.destroy() } catch (_) {}
+    }
+    req.on('data', chunk => {
+      if (settled) return
+      size += chunk.length
+      if (size > maxBytes) {
+        fail(new Error(`Upload exceeds ${maxBytes} bytes`))
+        return
+      }
+      chunks.push(Buffer.from(chunk))
+    })
+    req.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks))
+    })
+    req.on('error', fail)
+  })
+}
+
+function parseMultipartSingleFile (body, contentType) {
+  const match = /^multipart\/form-data\s*;\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '')
+  if (!match) throw new Error('Expected multipart/form-data upload')
+  const boundary = match[1] || match[2]
+  const delimiter = Buffer.from(`--${boundary}`)
+  let pos = 0
+
+  while (true) {
+    const start = body.indexOf(delimiter, pos)
+    if (start < 0) break
+    let cursor = start + delimiter.length
+    if (body[cursor] === 45 && body[cursor + 1] === 45) break
+    if (body[cursor] === 13 && body[cursor + 1] === 10) cursor += 2
+
+    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), cursor)
+    if (headerEnd < 0) throw new Error('Malformed multipart upload')
+    const headerText = body.subarray(cursor, headerEnd).toString('utf8')
+    const nextBoundary = body.indexOf(delimiter, headerEnd + 4)
+    if (nextBoundary < 0) throw new Error('Malformed multipart upload: missing boundary')
+
+    let dataEnd = nextBoundary
+    if (body[dataEnd - 2] === 13 && body[dataEnd - 1] === 10) dataEnd -= 2
+    const data = body.subarray(headerEnd + 4, dataEnd)
+    const disposition = /content-disposition:\s*form-data;([^\r\n]*)/i.exec(headerText)
+    const filenameMatch = disposition && /filename="([^"]*)"/i.exec(disposition[1])
+    if (filenameMatch) {
+      const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(headerText)
+      return {
+        filename: filenameMatch[1],
+        contentType: typeMatch ? typeMatch[1].trim() : 'application/octet-stream',
+        data
+      }
+    }
+    pos = nextBoundary + delimiter.length
+  }
+  throw new Error('No file field found in upload')
+}
+
+module.exports = function (app) {
+  let rawListener = null
+  let reassembler = null
+  let mapping = null
+  let config = {}
+  let running = false
+  let restartPlugin = null
+  let startedAt = null
+  const circuitStatus = new Map()
+
+  const stats = {
+    rawFrames: 0,
+    packetsDecoded: 0,
+    valuesPublished: 0,
+    dcPackets: 0,
+    acPackets: 0,
+    unmapped: 0,
+    unmappedDc: 0,
+    unmappedAc: 0,
+    invalidCzone: 0,
+    parseErrors: 0,
+    decodeErrors: 0,
+    lastError: null,
+    lastPacket: null,
+    lastDcPacket: null,
+    lastAcPacket: null,
+    lastRawFrame: null,
+    lastPublished: null
+  }
+
+  function log (message) {
+    if (typeof app.debug === 'function') app.debug(message)
+    else if (typeof app.setPluginStatus === 'function') app.setPluginStatus(message)
+  }
+
+  function setStatus (message) {
+    if (typeof app.setPluginStatus === 'function') app.setPluginStatus(message)
+  }
+
+  function decodeDc (packet) {
+    const header = decodeCzoneHeader(packet.payload, CURRENT_PGN_DC)
+    if (!header || packet.payload.length !== CZONE_PAYLOAD_SIZE) {
+      stats.invalidCzone++
+      return
+    }
+    stats.dcPackets++
+    for (let slot = 0; slot < RECORD_COUNT; slot++) {
+      const i = 4 + slot * RECORD_SIZE
+      const raw = packet.payload[i] | (packet.payload[i + 1] << 8) | (packet.payload[i + 2] << 16)
+      const currentRaw = raw & 0x3ff
+      const current = Number((currentRaw * DC_CURRENT_SCALE).toFixed(3))
+      const entry = lookupMapping(require('./lib/zcf'), mapping, header.module, header.page, slot, CURRENT_PGN_DC)
+      if (!entry) {
+        stats.unmapped++
+        stats.unmappedDc++
+        if (config.logUnmapped) log(`[CZONE DC] unmapped module=${hex2(header.module)} page=${header.page} slot=${slot} raw=${currentRaw}`)
+        continue
+      }
+      const pathName = publishCurrent(app, entry, header.module, slot, current, CURRENT_PGN_DC, packet.source)
+      stats.valuesPublished++
+      const record = { pgn: CURRENT_PGN_DC, module: header.module, page: header.page, slot, current, path: pathName, source: packet.source, timestamp: new Date().toISOString() }
+      stats.lastPacket = record
+      stats.lastDcPacket = record
+      stats.lastPublished = record
+      circuitStatus.set(pathName, record)
+    }
+  }
+
+  function decodeAc (packet) {
+    const header = decodeCzoneHeader(packet.payload, CURRENT_PGN_AC)
+    if (!header || packet.payload.length !== CZONE_PAYLOAD_SIZE) {
+      stats.invalidCzone++
+      return
+    }
+    stats.acPackets++
+    for (let slot = 0; slot < RECORD_COUNT; slot++) {
+      const i = 4 + slot * RECORD_SIZE
+      const rawCurrent = packet.payload[i]
+      const current = Number((rawCurrent * AC_CURRENT_SCALE).toFixed(3))
+      const entry = lookupMapping(require('./lib/zcf'), mapping, header.module, header.page, slot, CURRENT_PGN_AC)
+      if (!entry) {
+        stats.unmapped++
+        stats.unmappedAc++
+        if (config.logUnmapped) log(`[CZONE AC] unmapped module=${hex2(header.module)} page=${header.page} slot=${slot} raw=${rawCurrent}`)
+        continue
+      }
+      const pathName = publishCurrent(app, entry, header.module, slot, current, CURRENT_PGN_AC, packet.source)
+      stats.valuesPublished++
+      const record = { pgn: CURRENT_PGN_AC, module: header.module, page: header.page, slot, current, path: pathName, source: packet.source, timestamp: new Date().toISOString() }
+      stats.lastPacket = record
+      stats.lastAcPacket = record
+      stats.lastPublished = record
+      circuitStatus.set(pathName, record)
+    }
+  }
+
+  function handlePacket (packet) {
+    stats.packetsDecoded++
+    stats.lastRawFrame = { pgn: packet.pgn, source: packet.source, packetId: packet.packetId, timestamp: packet.timestamp, receivedAt: new Date().toISOString(), payloadBytes: packet.payload.length }
+    if (config.debugRaw) log(`[CZONE FP] PGN=${packet.pgn} src=${hex2(packet.source)} seq=${hex2(packet.packetId)} payload=${packet.payload.toString('hex').match(/../g).join(' ')}`)
+    if (packet.payload.length < CZONE_PAYLOAD_SIZE) {
+      stats.invalidCzone++
+      return
+    }
+    const header = decodeCzoneHeader(packet.payload, packet.pgn)
+    if (!header) {
+      stats.invalidCzone++
+      return
+    }
+    if (packet.pgn === CURRENT_PGN_DC) decodeDc(packet)
+    else if (packet.pgn === CURRENT_PGN_AC) decodeAc(packet)
+  }
+
+  function pluginDataDir () {
+    if (typeof app.getDataDirPath === 'function') return app.getDataDirPath()
+    return path.join(process.env.SIGNALK_NODE_CONFIG_DIR || path.join(os.homedir(), '.signalk'), 'plugin-data', 'signalk-czone')
+  }
+
+  function load () {
+    if (!config.zcfPath) {
+      throw new Error('No CZone ZCF file configured. Upload a ZCF or set zcfPath in the plugin configuration.')
+    }
+    if (!fs.existsSync(config.zcfPath)) {
+      throw new Error(`CZone ZCF file not found: ${config.zcfPath}`)
+    }
+    mapping = loadMapping(config.zcfPath)
+    if (!mapping) throw new Error('ZCF parser returned no mapping')
+    if (!Array.isArray(mapping.currentMappings)) {
+      throw new Error('ZCF parser returned no currentMappings array')
+    }
+    return mapping.currentMappings.length
+  }
+
+  function installZcfBytes (bytes, filename) {
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw new Error('Uploaded ZCF data is empty')
+    if (bytes.length > MAX_UPLOAD_BYTES) throw new Error(`ZCF exceeds ${MAX_UPLOAD_BYTES} bytes`)
+
+    const zcfDir = path.join(pluginDataDir(), 'zcf')
+    fs.mkdirSync(zcfDir, { recursive: true })
+    const target = path.join(zcfDir, safeFilename(filename))
+    const temp = `${target}.tmp-${process.pid}-${Date.now()}`
+    fs.writeFileSync(temp, bytes)
+    try {
+      const validated = loadMapping(temp)
+      if (!validated) throw new Error('ZCF parser returned no mapping')
+      fs.renameSync(temp, target)
+      return target
+    } catch (error) {
+      try { fs.unlinkSync(temp) } catch (_) {}
+      throw new Error(`Uploaded ZCF could not be parsed: ${error.message}`)
+    }
+  }
+
+  function persistPluginOptions (newConfig) {
+    if (typeof app.savePluginOptions !== 'function') return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      app.savePluginOptions(newConfig, error => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+  }
+
+  async function saveAndRestart (newConfig) {
+    // Persist the new path first. This makes the uploaded ZCF the actual
+    // configuration used by the next plugin start, rather than relying on
+    // the restart callback to persist it as a side effect.
+    await persistPluginOptions(newConfig)
+    if (typeof restartPlugin === 'function') {
+      restartPlugin(newConfig)
+    }
+  }
+
+  const plugin = {
+    id: 'signalk-czone',
+    name: 'CZone',
+    description: 'Standalone CZone NMEA2000 current decoder',
+
+    schema: () => ({
+      type: 'object',
+      properties: {
+        zcfPath: {
+          type: 'string',
+          title: 'Installed CZone ZCF file',
+          description: 'Path to the active CZone configuration file. Normally populated automatically after upload.',
+          default: ''
+        },
+        logUnmapped: {
+          type: 'boolean',
+          title: 'Log unmapped circuits',
+          default: false
+        },
+        debugRaw: {
+          type: 'boolean',
+          title: 'Log completed raw CZone packets',
+          default: false
+        }
+      }
+    }),
+
+    registerWithRouter: router => {
+      router.get('/diagnostics', (req, res) => {
+        try {
+          res.status(200).json(plugin.status())
+        } catch (error) {
+          stats.lastError = error.message
+          res.status(500).json({ ok: false, error: error.message })
+        }
+      })
+
+      router.post('/zcf/upload', async (req, res) => {
+        try {
+          const body = await readRequestBody(req)
+          const file = parseMultipartSingleFile(body, req.headers['content-type'])
+          if (!/\.zcf$/i.test(file.filename || '')) throw new Error('Please upload a .zcf file')
+          const target = installZcfBytes(file.data, file.filename)
+          const newConfig = {
+            zcfPath: target,
+            logUnmapped: config.logUnmapped === true,
+            debugRaw: config.debugRaw === true
+          }
+          await saveAndRestart(newConfig)
+          res.status(200).json({
+            ok: true,
+            zcfPath: target,
+            filename: path.basename(target),
+            bytes: file.data.length,
+            configuration: newConfig
+          })
+        } catch (error) {
+          stats.lastError = error.message
+          res.status(400).json({ ok: false, error: error.message })
+        }
+      })
+    },
+
+    start: function (options, restart) {
+      if (running) return
+      restartPlugin = restart
+      config = getConfig(options)
+      try {
+        const count = load()
+        startedAt = Date.now()
+        circuitStatus.clear()
+        stats.lastError = null
+        reassembler = createFastPacketReassembler(handlePacket)
+        rawListener = line => {
+          stats.rawFrames++
+          stats.lastRawFrame = { receivedAt: new Date().toISOString(), type: 'canboatjs:rawoutput' }
+          const frame = parseRawLine(line)
+          if (!frame) {
+            stats.parseErrors++
+            return
+          }
+          if (frame.pgn !== CURRENT_PGN_DC && frame.pgn !== CURRENT_PGN_AC) return
+          reassembler.accept(frame)
+        }
+        app.on('canboatjs:rawoutput', rawListener)
+        running = true
+        setStatus(`CZone started: ${count} current mappings; raw PGNs 130817/130822`)
+      } catch (error) {
+        stats.decodeErrors++
+        stats.lastError = error.message
+        setStatus(`CZone error: ${error.message}`)
+        throw error
+      }
+    },
+
+    stop: function () {
+      if (rawListener) app.removeListener('canboatjs:rawoutput', rawListener)
+      rawListener = null
+      if (reassembler) reassembler.clear()
+      reassembler = null
+      running = false
+      startedAt = null
+      circuitStatus.clear()
+      setStatus('CZone stopped')
+    },
+
+    status: function () {
+      const now = Date.now()
+      const currentMappings = mapping && Array.isArray(mapping.currentMappings) ? mapping.currentMappings : []
+      const byPgn = currentMappings.reduce((acc, entry) => {
+        const key = String(entry.pgn)
+        acc[key] = (acc[key] || 0) + 1
+        return acc
+      }, {})
+      return {
+        running,
+        uptimeSeconds: startedAt == null ? 0 : Math.max(0, Math.floor((now - startedAt) / 1000)),
+        zcf: {
+          filePath: config.zcfPath || null,
+          fileName: config.zcfPath ? path.basename(config.zcfPath) : null,
+          fileSize: mapping && mapping.fileSize != null ? mapping.fileSize : null,
+          circuits: mapping && Array.isArray(mapping.circuits) ? mapping.circuits.length : 0,
+          currentMappings: currentMappings.length,
+          mappingsByPgn: byPgn,
+          warnings: mapping && Array.isArray(mapping.warnings) ? mapping.warnings : []
+        },
+        counters: { ...stats },
+        diagnostics: {
+          reassemblyInProgress: reassembler ? reassembler.size() : 0,
+          config: { logUnmapped: config.logUnmapped === true, debugRaw: config.debugRaw === true },
+          lastDcPacket: stats.lastDcPacket,
+          lastAcPacket: stats.lastAcPacket,
+          lastPublished: stats.lastPublished,
+          lastRawPacket: stats.lastRawFrame,
+          trackedCircuits: circuitStatus.size
+        },
+        circuits: Array.from(circuitStatus.values()).sort((a, b) => a.path.localeCompare(b.path))
+      }
+    }
+  }
+
+  return plugin
+}
