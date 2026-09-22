@@ -1,4 +1,4 @@
-# signalk-czone 0.2.2
+# signalk-czone 
 
 Standalone Signal K CZone NMEA2000 current decoder with a dedicated ZCF upload configuration panel.
 
