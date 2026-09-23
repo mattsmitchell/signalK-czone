@@ -55,7 +55,7 @@ For an npm-style install from the tarball, use:
 
 ```bash
 cd /root/.signalk/node_modules
-npm install /path/to/signalk-czone-0.3.0-beta.5.tar.gz --omit=dev
+npm install /path/to/signalk-czone-0.3.0-beta.6.tar.gz --omit=dev
 ```
 
 The package has no runtime npm dependencies. Do not modify Signal K Server or canboatjs.
@@ -82,7 +82,7 @@ Set `debugRaw` true temporarily if completed 28-byte packets need to be inspecte
 After a successful ZCF upload, 0.2.5 explicitly persists the new `zcfPath` before restarting the plugin. The configuration panel also updates its displayed installed path immediately and uses that path for subsequent configuration saves, so the UI and the plugin startup configuration stay aligned.
 
 
-## 0.3.0-beta.5
+## 0.3.0-beta.6
 
 This beta keeps the stable circuit-name Signal K paths and diagnostics/status reporting, and adds explicit AC/DC classification metadata for downstream consumers such as InfluxDB.
 
@@ -217,9 +217,23 @@ The current Signal K integration listens to:
 canboatjs:rawoutput
 ```
 
-It parses the raw YDWG02 line into timestamp, CAN ID, source address, PGN, and CAN data bytes.
+The decoder accepts both raw-input representations currently encountered in the field:
 
-CZone PGNs `130817` and `130822` are then reassembled as Fast Packets before CZone payload validation and ZCF lookup.
+1. **YDWG02 text lines**, for example:
+
+```text
+23:31:37.646 R 1DFF010B C0 1C 27 99 00 F8 00 00
+```
+
+2. **JSON/object NMEA2000 frames**, as used by some Signal K/NMEA2000 providers such as a Victron Cerbo GX environment, for example:
+
+```json
+{"pgn":{"canId":435815455,"prio":6,"src":31,"pgn":129540,"dst":255},"length":8,"data":["8e","00","f2","13","43","2a","c7","9c"]}
+```
+
+For the JSON representation, the parser normalizes `pgn.canId`, `pgn.src`, `pgn.pgn`, `length`, and the hexadecimal `data` array into the same internal CAN-frame structure used by the text-line decoder. A JSON string and an already-parsed JavaScript object are both accepted.
+
+CZone PGNs `130817` and `130822` are then reassembled as Fast Packets before CZone payload validation and ZCF lookup. The plugin does not depend on a particular NMEA2000 source address.
 
 The decoder does not hard-code a CZone source address. The source address is part of the Fast Packet stream key because the same PGN can appear from different source addresses.
 
@@ -247,5 +261,6 @@ Only the installed path is stored in plugin configuration; the binary ZCF is not
 - **0.3.0-beta.3** — added backend diagnostics/status reporting.
 - **0.3.0-beta.4** — added the Diagnostics tab/page to the configuration UI.
 - **0.3.0-beta.5** — added explicit AC/DC source classification for downstream telemetry storage while retaining stable circuit-name paths and the diagnostics/status tooling.
+- **0.3.0-beta.6** — accepts both traditional YDWG02 text frames and JSON/object NMEA2000 frames, including the representation used by Victron Cerbo GX environments.
 
 The beta is intended for extended real-world testing before a stable `0.3.0` release.
