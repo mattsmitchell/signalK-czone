@@ -1,12 +1,37 @@
-# signalk-czone 
+# signalk-czone
 
-Standalone Signal K CZone NMEA2000 current decoder with a dedicated ZCF upload configuration panel.
+`signalk-czone` makes CZone electrical current information available to Signal K.
+
+It listens to NMEA 2000 traffic, identifies CZone current messages, reassembles their Fast Packets, decodes the AC and DC current measurements, and uses the vessel's CZone ZCF configuration to determine which circuit each measurement belongs to. The resulting currents are published to Signal K using stable circuit-name-based paths, with AC/DC classification metadata for downstream systems such as InfluxDB.
+
+The plugin accepts both raw YDWG02-style NMEA 2000 frames and parsed JSON/object NMEA 2000 frames. It also provides a dedicated ZCF upload configuration panel and diagnostics/status reporting for monitoring the decoder.
+
+In plain English: **it watches the NMEA 2000 network for CZone electrical data, turns the raw CZone measurements into amps, identifies the CZone circuit they belong to, and makes those currents available throughout Signal K.**
+
+## What it does
+
+The plugin:
+
+- listens to NMEA 2000 traffic without modifying Signal K Server, canboatjs, n2k-signalk, or global PGN definitions;
+- supports both raw YDWG02-style frames and parsed JSON/object NMEA 2000 frames;
+- identifies CZone AC and DC current messages;
+- reassembles CZone Fast Packets;
+- validates the CZone `27 99` payload format;
+- decodes PGN 130817 (AC/ACOI) and PGN 130822 (DC/COI);
+- uses the configured ZCF to map measurements to named CZone circuits;
+- publishes stable Signal K paths such as `electrical.czone.Water_Heater_Port.current`;
+- carries AC/DC classification metadata as `CZone-AC` or `CZone-DC`;
+- provides ZCF upload and configuration persistence; and
+- provides diagnostics/status information for troubleshooting and field testing.
+
+The plugin is therefore a **CZone electrical-current decoder and Signal K integration**, rather than a general-purpose NMEA 2000 decoder.
+
 
 ## Design
 
 The plugin does **not** modify Signal K Server, canboatjs, n2k-signalk, or any global PGN definitions.
 
-It listens to the raw `canboatjs:rawoutput` event, extracts the NMEA2000 CAN ID, reassembles Fast Packets, validates the CZone `27 99` payload, then decodes PGNs 130822 (DC/COI) and 130817 (AC/ACOI) and applies the existing ZCF mapping.
+At the input boundary it normalizes the NMEA 2000 frame representation, then extracts the CAN ID, reassembles Fast Packets, validates the CZone `27 99` payload, decodes PGNs 130822 (DC/COI) and 130817 (AC/ACOI), and applies the existing ZCF mapping.
 
 The existing `lib/zcf.js` is intentionally not included here: keep the working ZCF parser from the current plugin installation unchanged.
 
@@ -55,7 +80,7 @@ For an npm-style install from the tarball, use:
 
 ```bash
 cd /root/.signalk/node_modules
-npm install /path/to/signalk-czone-0.3.0-beta.6.tar.gz --omit=dev
+npm install /path/to/signalk-czone-0.3.0-beta.5.tar.gz --omit=dev
 ```
 
 The package has no runtime npm dependencies. Do not modify Signal K Server or canboatjs.
@@ -82,7 +107,7 @@ Set `debugRaw` true temporarily if completed 28-byte packets need to be inspecte
 After a successful ZCF upload, 0.2.5 explicitly persists the new `zcfPath` before restarting the plugin. The configuration panel also updates its displayed installed path immediately and uses that path for subsequent configuration saves, so the UI and the plugin startup configuration stay aligned.
 
 
-## 0.3.0-beta.6
+## 0.3.0-beta.5
 
 This beta keeps the stable circuit-name Signal K paths and diagnostics/status reporting, and adds explicit AC/DC classification metadata for downstream consumers such as InfluxDB.
 
@@ -168,7 +193,11 @@ For the supplied ZCF:
 
 The AC slot's remaining two bytes are intentionally left opaque until additional fields are validated.
 
-### InfluxDB verification
+### Optional: InfluxDB verification
+
+The InfluxDB examples in this section are optional and only apply if the Signal K server is also running and configured with the `signalk-to-influxdb2` plugin. `signalk-czone` does not connect to or write directly to InfluxDB; it publishes the Signal K values and AC/DC source metadata that `signalk-to-influxdb2` can store.
+
+If `signalk-to-influxdb2` is not installed and configured, the commands below will not return CZone data.
 
 A quick check of the classification metadata can be performed with:
 
@@ -217,23 +246,9 @@ The current Signal K integration listens to:
 canboatjs:rawoutput
 ```
 
-The decoder accepts both raw-input representations currently encountered in the field:
+It parses the raw YDWG02 line into timestamp, CAN ID, source address, PGN, and CAN data bytes.
 
-1. **YDWG02 text lines**, for example:
-
-```text
-23:31:37.646 R 1DFF010B C0 1C 27 99 00 F8 00 00
-```
-
-2. **JSON/object NMEA2000 frames**, as used by some Signal K/NMEA2000 providers such as a Victron Cerbo GX environment, for example:
-
-```json
-{"pgn":{"canId":435815455,"prio":6,"src":31,"pgn":129540,"dst":255},"length":8,"data":["8e","00","f2","13","43","2a","c7","9c"]}
-```
-
-For the JSON representation, the parser normalizes `pgn.canId`, `pgn.src`, `pgn.pgn`, `length`, and the hexadecimal `data` array into the same internal CAN-frame structure used by the text-line decoder. A JSON string and an already-parsed JavaScript object are both accepted.
-
-CZone PGNs `130817` and `130822` are then reassembled as Fast Packets before CZone payload validation and ZCF lookup. The plugin does not depend on a particular NMEA2000 source address.
+CZone PGNs `130817` and `130822` are then reassembled as Fast Packets before CZone payload validation and ZCF lookup.
 
 The decoder does not hard-code a CZone source address. The source address is part of the Fast Packet stream key because the same PGN can appear from different source addresses.
 
@@ -261,6 +276,5 @@ Only the installed path is stored in plugin configuration; the binary ZCF is not
 - **0.3.0-beta.3** — added backend diagnostics/status reporting.
 - **0.3.0-beta.4** — added the Diagnostics tab/page to the configuration UI.
 - **0.3.0-beta.5** — added explicit AC/DC source classification for downstream telemetry storage while retaining stable circuit-name paths and the diagnostics/status tooling.
-- **0.3.0-beta.6** — accepts both traditional YDWG02 text frames and JSON/object NMEA2000 frames, including the representation used by Victron Cerbo GX environments.
 
 The beta is intended for extended real-world testing before a stable `0.3.0` release.
