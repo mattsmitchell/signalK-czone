@@ -1,4 +1,4 @@
-# signalk-czone 0.2.2
+# signalk-czone 
 
 Standalone Signal K CZone NMEA2000 current decoder with a dedicated ZCF upload configuration panel.
 
@@ -55,7 +55,7 @@ For an npm-style install from the tarball, use:
 
 ```bash
 cd /root/.signalk/node_modules
-npm install /path/to/signalk-czone-0.3.0-beta.3.tar.gz --omit=dev
+npm install /path/to/signalk-czone-0.3.0-beta.5.tar.gz --omit=dev
 ```
 
 The package has no runtime npm dependencies. Do not modify Signal K Server or canboatjs.
@@ -82,30 +82,170 @@ Set `debugRaw` true temporarily if completed 28-byte packets need to be inspecte
 After a successful ZCF upload, 0.2.5 explicitly persists the new `zcfPath` before restarting the plugin. The configuration panel also updates its displayed installed path immediately and uses that path for subsequent configuration saves, so the UI and the plugin startup configuration stay aligned.
 
 
-## 0.3.0-beta.4
+## 0.3.0-beta.5
 
-This beta adds plugin diagnostics/status reporting on top of the stable circuit-name Signal K paths.
+This beta keeps the stable circuit-name Signal K paths and diagnostics/status reporting, and adds explicit AC/DC classification metadata for downstream consumers such as InfluxDB.
 
-The plugin status reports:
+### Diagnostics and status
+
+The plugin configuration panel includes a **Diagnostics** tab alongside **Configuration**. The diagnostics view polls the plugin status periodically and is intended to make field testing and troubleshooting possible without inspecting the source code.
+
+The status reports:
 
 - running state and uptime
-- active ZCF filename/path/size
+- active ZCF filename, path, and size
 - total circuits and current mappings
-- mapping counts by PGN
-- raw-frame, decoded-packet, DC/AC packet, published-value, parse-error and decode-error counters
-- unmapped DC and AC counts
+- current-mapping counts by PGN
+- raw NMEA2000 frame count
+- completed CZone Fast Packet count
+- DC and AC packet counts
+- published-value count
+- raw-frame parse errors
 - invalid CZone packet count
-- Fast Packet reassembly state
+- startup/decode errors
+- unmapped DC and AC circuit counts
+- Fast Packets currently in progress
 - last DC packet, last AC packet, and last published value
-- last value seen for each published Signal K circuit
 - ZCF parser warnings
+- per-circuit last observed value and update time
+- per-circuit diagnostic mapping information including module, page, slot, source address, and PGN
 
-The beta is intended for extended real-world testing before a stable 0.3.0 release.
+The plugin also exposes a diagnostics route at:
+
+```text
+/diagnostics
+```
+
+Use the **Diagnostics** tab in the Signal K plugin configuration panel for normal access.
+
+### Stable circuit naming
+
+Published current paths use the ZCF circuit name rather than the CZone module/channel or page/slot:
+
+```text
+electrical.czone.<circuit>.current
+```
+
+For example:
+
+```text
+electrical.czone.100L_Fridge.current
+electrical.czone.200L_Fridge.current
+electrical.czone.AIS.current
+electrical.czone.Water_Heater_Port.current
+electrical.czone.Starlink.current
+```
+
+The circuit name is the stable public Signal K identity. Module, channel, page, and slot are retained as diagnostic mapping information and must not be treated as the public circuit identity.
+
+Circuit names are sanitized for Signal K paths by trimming whitespace and replacing runs of spaces/punctuation with `_`, with leading/trailing `_` removed.
 
 ### AC/DC classification
 
 The public current paths remain stable and unchanged:
 
-`electrical.czone.<circuit>.current`
+```text
+electrical.czone.<circuit>.current
+```
 
-Each published value is additionally classified as `AC` or `DC`. The plugin carries this classification in the Signal K source metadata and in the per-path metadata. The source identity is `CZone-AC` or `CZone-DC`, so `signalk-to-influxdb2` exposes the distinction through its InfluxDB `source` tag without adding `AC` or `DC` to the circuit path.
+Each published value is additionally classified as AC or DC through Signal K source/path metadata.
+
+The source identity is:
+
+```text
+CZone-AC
+CZone-DC
+```
+
+This allows `signalk-to-influxdb2` to expose the distinction through its InfluxDB `source` tag without adding `AC` or `DC` to the circuit path.
+
+For the supplied ZCF:
+
+- PGN `130822` is the DC/COI current decoder and uses 0.1 A/count.
+- PGN `130817` is the AC/ACOI current decoder and uses 0.2 A/count for the validated AC current field.
+- Module `0xF8` is classified as the validated AC mapping used by the supplied ZCF.
+- Module `0x28` records are excluded from the CZone circuit-current mapping.
+
+The AC slot's remaining two bytes are intentionally left opaque until additional fields are validated.
+
+### InfluxDB verification
+
+A quick check of the classification metadata can be performed with:
+
+```bash
+influx query '
+from(bucket: "DataBucket")
+  |> range(start: -15m)
+  |> filter(fn: (r) => r._measurement == "electrical.czone.Water_Heater_Port.current")
+  |> limit(n: 10)
+'   --host http://127.0.0.1:8086   --org SugarShack   --token "$INFLUX_TOKEN"
+```
+
+The Water Heater Port circuit should carry:
+
+```text
+source = CZone-AC
+```
+
+A DC circuit such as Starlink should carry:
+
+```text
+source = CZone-DC
+```
+
+A combined check can group the CZone current series by classification:
+
+```bash
+influx query '
+from(bucket: "DataBucket")
+  |> range(start: -15m)
+  |> filter(fn: (r) => r._measurement =~ /^electrical\.czone\./)
+  |> keep(columns: ["_measurement", "_time", "_value", "source"])
+  |> group(columns: ["source"])
+'   --host http://127.0.0.1:8086   --org SugarShack   --token "$INFLUX_TOKEN"
+```
+
+For the supplied ZCF, the current mappings are 83 DC mappings and 8 AC mappings. This count describes the supplied ZCF only; it is not a protocol requirement.
+
+### Raw NMEA2000 transport
+
+The decoder is intentionally transport-independent after the raw CAN frame is obtained.
+
+The current Signal K integration listens to:
+
+```text
+canboatjs:rawoutput
+```
+
+It parses the raw YDWG02 line into timestamp, CAN ID, source address, PGN, and CAN data bytes.
+
+CZone PGNs `130817` and `130822` are then reassembled as Fast Packets before CZone payload validation and ZCF lookup.
+
+The decoder does not hard-code a CZone source address. The source address is part of the Fast Packet stream key because the same PGN can appear from different source addresses.
+
+The plugin does not patch Signal K Server, canboatjs, n2k-signalk, or global PGN definitions.
+
+### ZCF upload and persistence
+
+The custom configuration panel uploads a `.zcf` file through:
+
+```text
+POST /plugins/signalk-czone/zcf/upload
+```
+
+After validation, the plugin installs the file in its plugin data directory, persists the active `zcfPath`, and restarts using the new configuration.
+
+Only the installed path is stored in plugin configuration; the binary ZCF is not stored in JSON.
+
+### Version history
+
+- **0.2.2** — replaced the unreliable generic RJSF `data-url` upload with a dedicated configuration-panel uploader.
+- **0.2.4** — restored the ZCF startup loading function and made invalid/missing ZCF configuration fail clearly.
+- **0.2.5** — fixed ZCF path persistence and configuration-panel path handling.
+- **0.3.0-beta.1** — first self-contained beta with the working ZCF parser, raw NMEA2000/CZone decoder, configuration panel, and validated ZCF upload/persistence.
+- **0.3.0-beta.2** — changed public Signal K current paths to stable ZCF circuit names.
+- **0.3.0-beta.3** — added backend diagnostics/status reporting.
+- **0.3.0-beta.4** — added the Diagnostics tab/page to the configuration UI.
+- **0.3.0-beta.5** — added explicit AC/DC source classification for downstream telemetry storage while retaining stable circuit-name paths and the diagnostics/status tooling.
+
+The beta is intended for extended real-world testing before a stable `0.3.0` release.
