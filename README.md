@@ -1,4 +1,4 @@
-# signalk-czone 
+# signalk-czone 0.2.2
 
 Standalone Signal K CZone NMEA2000 current decoder with a dedicated ZCF upload configuration panel.
 
@@ -101,3 +101,11 @@ The plugin status reports:
 - ZCF parser warnings
 
 The beta is intended for extended real-world testing before a stable 0.3.0 release.
+
+### AC/DC classification
+
+The public current paths remain stable and unchanged:
+
+`electrical.czone.<circuit>.current`
+
+Each published value is additionally classified as `AC` or `DC`. The plugin carries this classification in the Signal K source metadata and in the per-path metadata. The source identity is `CZone-AC` or `CZone-DC`, so `signalk-to-influxdb2` exposes the distinction through its InfluxDB `source` tag without adding `AC` or `DC` to the circuit path.

@@ -76,10 +76,30 @@ function mappingName (entry) {
 function publishCurrent (app, entry, module, channel, current, pgn, source) {
   const friendly = safeName(mappingName(entry))
   const pathName = `electrical.czone.${friendly}.current`
+  const circuitType = pgn === CURRENT_PGN_AC ? 'AC' : 'DC'
+
+  // Keep the stable public Signal K path free of transport/protocol details.
+  // The circuit class is carried in source metadata as well as the source
+  // identity. signalk-to-influxdb2 persists the resulting $source as its
+  // `source` tag, so Grafana/Influx can distinguish AC from DC without
+  // changing the established electrical.czone.<circuit>.current names.
   app.handleMessage('signalk-czone', {
     updates: [{
-      source: { label: 'CZone', src: source, pgn },
+      source: {
+        label: `CZone-${circuitType}`,
+        type: 'CZone',
+        src: source,
+        pgn
+      },
       timestamp: new Date().toISOString(),
+      meta: [{
+        path: pathName,
+        value: {
+          description: `${circuitType} CZone circuit current`,
+          circuitType,
+          czonePgn: pgn
+        }
+      }],
       values: [{ path: pathName, value: current }]
     }]
   })
