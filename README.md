@@ -8,6 +8,9 @@ The plugin accepts both raw YDWG02-style NMEA 2000 frames and parsed JSON/object
 
 In plain English: **it watches the NMEA 2000 network for CZone electrical data, turns the raw CZone measurements into amps, identifies the CZone circuit they belong to, and makes those currents available throughout Signal K.**
 
+
+<img width="2826" height="1220" alt="Image" src="https://github.com/user-attachments/assets/2768aea9-cbcd-446b-8010-0ed0aabc1865" />
+
 ## What it does
 
 The plugin:
@@ -96,6 +99,10 @@ journalctl -u signalk --since "2 minutes ago" --no-pager | grep CZONE
 ```
 
 Set `debugRaw` true temporarily if completed 28-byte packets need to be inspected.
+
+Also can see on the configuration tab some the most recent messages
+<img width="1242" height="1442" alt="Image" src="https://github.com/user-attachments/assets/d318f74a-cd27-4fe9-aafb-7bacd6131c51" />
+
 
 ## 0.2.4 startup fix
 
@@ -233,6 +240,9 @@ from(bucket: "DataBucket")
   |> group(columns: ["source"])
 '   --host http://127.0.0.1:8086   --org SugarShack   --token "$INFLUX_TOKEN"
 ```
+Something like this can be created in grafana from the influxDB data
+
+<img width="2900" height="1708" alt="Image" src="https://github.com/user-attachments/assets/92c458b3-6709-44be-ba49-d4029791c0d3" />
 
 For the supplied ZCF, the current mappings are 83 DC mappings and 8 AC mappings. This count describes the supplied ZCF only; it is not a protocol requirement.
 
