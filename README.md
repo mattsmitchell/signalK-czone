@@ -71,7 +71,39 @@ The other two bytes of each AC slot are deliberately left opaque until validated
 
 ## DC 130822
 
-The existing validated decoder is retained: low 10 bits of each 3-byte slot × 0.1 A.
+The DC/COI slot format has been corrected from the earlier packed-value interpretation. Each 3-byte record is decoded independently:
+
+```text
+byte 0  → current
+byte 1  → low byte of secondary value
+byte 2  → high byte of secondary value
+```
+
+The current is:
+
+```text
+current_A = byte0 × 0.1
+```
+
+The secondary value is a little-endian 16-bit value:
+
+```text
+value_raw = byte1 | (byte2 << 8)
+```
+
+The observed/validated CZone level encoding is:
+
+| `value_raw` | Interpretation | Percentage |
+| ---: | --- | ---: |
+| `0x0400` / 1024 | OFF | 0% |
+| `0x0401`–`0x07E7` | DIMMED | `(value_raw - 1024) / 10` |
+| `0x07E8` / 2024 | ON / 100% | 100% |
+| `0x07E9`–`0x0800` | ON | 100% |
+| other values | UNKNOWN | — |
+
+The dimmed encoding has been checked against controlled observations at 60%, 75%, 80%, 90%, and 100%. The parser now uses byte 0 exclusively for current, avoiding the previous interpretation that combined all three bytes into a packed current value and could produce implausibly high readings on dimmed circuits.
+
+The decoded secondary state and percentage are retained in the plugin diagnostics for each tracked DC circuit. The public Signal K current path remains unchanged (`electrical.czone.<circuit>.current`).
 
 ## Installation
 
@@ -113,6 +145,12 @@ Also can see on the configuration tab some the most recent messages
 
 After a successful ZCF upload, 0.2.5 explicitly persists the new `zcfPath` before restarting the plugin. The configuration panel also updates its displayed installed path immediately and uses that path for subsequent configuration saves, so the UI and the plugin startup configuration stay aligned.
 
+
+## 0.3.0-beta.7
+
+This beta corrects the PGN 130822 DC/COI three-byte record decoder using the validated CZone wire format described above. DC current now comes from record byte 0 at 0.1 A/count, while bytes 1-2 are decoded as a little-endian secondary level value. Diagnostics now expose the decoded DC level state and percentage alongside the current value.
+
+The public Signal K circuit-current paths are unchanged.
 
 ## 0.3.0-beta.5
 

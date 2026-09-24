@@ -12,7 +12,11 @@ const {
 const CURRENT_PGN_DC = 130822
 const CURRENT_PGN_AC = 130817
 const AC_CURRENT_SCALE = 0.2 // observed: raw 40 == 8.0 A on Water Heater Port
-const DC_CURRENT_SCALE = 0.1 // validated against existing DC/COI captures
+const DC_CURRENT_SCALE = 0.1 // DC record byte 0: 0.1 A/count
+const DC_LEVEL_OFF = 0x0400
+const DC_LEVEL_DIMMED_MIN = 0x0401
+const DC_LEVEL_ON_100 = 0x07e8
+const DC_LEVEL_ON_MAX = 0x0800
 const RECORD_COUNT = 8
 const RECORD_SIZE = 3
 const CZONE_PAYLOAD_SIZE = 28
@@ -35,8 +39,7 @@ function getConfig (config) {
   return {
     zcfPath: c.zcfPath || '',
     logUnmapped: c.logUnmapped === true,
-    debugRaw: c.debugRaw === true,
-    debugDcCircuits: typeof c.debugDcCircuits === 'string' ? c.debugDcCircuits : 'Salon Lights,Stbd Shower lights'
+    debugRaw: c.debugRaw === true
   }
 }
 
@@ -68,19 +71,6 @@ function lookupMapping (zcf, mapping, module, page, slot, pgn) {
     Number(x.slot) === slot &&
     (pgn === undefined || Number(x.pgn) === pgn)
   ) || null
-}
-
-function parseDebugCircuitNames (value) {
-  return new Set(String(value || '')
-    .split(',')
-    .map(x => x.trim().toLowerCase())
-    .filter(Boolean))
-}
-
-function debugCircuitMatch (entry, targetNames) {
-  if (!entry || !targetNames || targetNames.size === 0) return false
-  const name = mappingName(entry)
-  return name != null && targetNames.has(String(name).trim().toLowerCase())
 }
 
 function mappingName (entry) {
@@ -192,7 +182,6 @@ module.exports = function (app) {
   let reassembler = null
   let mapping = null
   let config = {}
-  let debugDcTargets = new Set()
   let running = false
   let restartPlugin = null
   let startedAt = null
@@ -227,6 +216,17 @@ module.exports = function (app) {
     if (typeof app.setPluginStatus === 'function') app.setPluginStatus(message)
   }
 
+  function decodeDcLevel (valueRaw) {
+    if (valueRaw === DC_LEVEL_OFF) return { state: 'OFF', percent: 0 }
+    if (valueRaw >= DC_LEVEL_DIMMED_MIN && valueRaw < DC_LEVEL_ON_100) {
+      return { state: 'DIMMED', percent: Number(((valueRaw - 1024) / 10).toFixed(1)) }
+    }
+    if (valueRaw >= DC_LEVEL_ON_100 && valueRaw <= DC_LEVEL_ON_MAX) {
+      return { state: 'ON', percent: 100 }
+    }
+    return { state: 'UNKNOWN', percent: null }
+  }
+
   function decodeDc (packet) {
     const header = decodeCzoneHeader(packet.payload, CURRENT_PGN_DC)
     if (!header || packet.payload.length !== CZONE_PAYLOAD_SIZE) {
@@ -234,58 +234,37 @@ module.exports = function (app) {
       return
     }
     stats.dcPackets++
-
-    // Temporary, targeted protocol capture for dimmable circuits. We log the
-    // complete 28-byte CZone payload only for the configured module/page
-    // pairs that contain the requested circuits. This deliberately does not
-    // assume that the current field is the low 10 bits of the 3-byte record.
-    const debugEntries = []
     for (let slot = 0; slot < RECORD_COUNT; slot++) {
       const i = 4 + slot * RECORD_SIZE
-      const entry = lookupMapping(require('./lib/zcf'), mapping, header.module, header.page, slot, CURRENT_PGN_DC)
-      if (debugCircuitMatch(entry, debugDcTargets)) {
-        const bytes = packet.payload.subarray(i, i + RECORD_SIZE)
-        const raw24 = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16)
-        debugEntries.push({
-          name: mappingName(entry),
-          slot,
-          bytes: bytes.toString('hex').match(/../g).join(' '),
-          b0: bytes[0],
-          b1: bytes[1],
-          b2: bytes[2],
-          u16le: bytes[0] | (bytes[1] << 8),
-          u24le: raw24,
-          low10: raw24 & 0x3ff
-        })
-      }
-    }
-
-    if (debugEntries.length) {
-      const slots = []
-      for (let slot = 0; slot < RECORD_COUNT; slot++) {
-        const i = 4 + slot * RECORD_SIZE
-        slots.push(`${slot}:${packet.payload.subarray(i, i + RECORD_SIZE).toString('hex')}`)
-      }
-      for (const d of debugEntries) {
-        log(`[CZONE DC DEBUG] circuit=${d.name} source=${hex2(packet.source)} module=${hex2(header.module)} page=${header.page} slot=${d.slot} bytes=${d.bytes} b0=${d.b0} b1=${d.b1} b2=${d.b2} u16le=${d.u16le} u24le=${d.u24le} low10=${d.low10} payload=${packet.payload.toString('hex').match(/../g).join(' ')} slots=${slots.join('|')}`)
-      }
-    }
-
-    for (let slot = 0; slot < RECORD_COUNT; slot++) {
-      const i = 4 + slot * RECORD_SIZE
-      const raw = packet.payload[i] | (packet.payload[i + 1] << 8) | (packet.payload[i + 2] << 16)
-      const currentRaw = raw & 0x3ff
+      const currentRaw = packet.payload[i]
+      const levelRaw = packet.payload[i + 1] | (packet.payload[i + 2] << 8)
       const current = Number((currentRaw * DC_CURRENT_SCALE).toFixed(3))
+      const level = decodeDcLevel(levelRaw)
       const entry = lookupMapping(require('./lib/zcf'), mapping, header.module, header.page, slot, CURRENT_PGN_DC)
       if (!entry) {
         stats.unmapped++
         stats.unmappedDc++
-        if (config.logUnmapped) log(`[CZONE DC] unmapped module=${hex2(header.module)} page=${header.page} slot=${slot} raw=${currentRaw}`)
+        if (config.logUnmapped) {
+          log(`[CZONE DC] unmapped module=${hex2(header.module)} page=${header.page} slot=${slot} currentRaw=${currentRaw} levelRaw=${levelRaw}`)
+        }
         continue
       }
       const pathName = publishCurrent(app, entry, header.module, slot, current, CURRENT_PGN_DC, packet.source)
       stats.valuesPublished++
-      const record = { pgn: CURRENT_PGN_DC, module: header.module, page: header.page, slot, current, path: pathName, source: packet.source, timestamp: new Date().toISOString() }
+      const record = {
+        pgn: CURRENT_PGN_DC,
+        module: header.module,
+        page: header.page,
+        slot,
+        current,
+        currentRaw,
+        levelRaw,
+        levelState: level.state,
+        levelPercent: level.percent,
+        path: pathName,
+        source: packet.source,
+        timestamp: new Date().toISOString()
+      }
       stats.lastPacket = record
       stats.lastDcPacket = record
       stats.lastPublished = record
@@ -421,12 +400,6 @@ module.exports = function (app) {
           type: 'boolean',
           title: 'Log completed raw CZone packets',
           default: false
-        },
-        debugDcCircuits: {
-          type: 'string',
-          title: 'Target DC circuits for protocol debug',
-          description: 'Comma-separated CZone circuit names. The complete 130822 payload is logged only for packets containing these circuits. Temporary diagnostic option.',
-          default: 'Salon Lights,Stbd Shower lights'
         }
       }
     }),
@@ -450,8 +423,7 @@ module.exports = function (app) {
           const newConfig = {
             zcfPath: target,
             logUnmapped: config.logUnmapped === true,
-            debugRaw: config.debugRaw === true,
-            debugDcCircuits: config.debugDcCircuits || 'Salon Lights,Stbd Shower lights'
+            debugRaw: config.debugRaw === true
           }
           await saveAndRestart(newConfig)
           res.status(200).json({
@@ -472,7 +444,6 @@ module.exports = function (app) {
       if (running) return
       restartPlugin = restart
       config = getConfig(options)
-      debugDcTargets = parseDebugCircuitNames(config.debugDcCircuits)
       try {
         const count = load()
         startedAt = Date.now()
@@ -535,7 +506,7 @@ module.exports = function (app) {
         counters: { ...stats },
         diagnostics: {
           reassemblyInProgress: reassembler ? reassembler.size() : 0,
-          config: { logUnmapped: config.logUnmapped === true, debugRaw: config.debugRaw === true, debugDcCircuits: config.debugDcCircuits || '' },
+          config: { logUnmapped: config.logUnmapped === true, debugRaw: config.debugRaw === true },
           lastDcPacket: stats.lastDcPacket,
           lastAcPacket: stats.lastAcPacket,
           lastPublished: stats.lastPublished,
