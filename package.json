@@ -7,13 +7,22 @@
     "signalk-node-server-plugin",
     "signalk-plugin",
     "signalk-plugin-configurator",
+    "signalk-category-digital-switching",
     "czone",
     "nmea2000"
   ],
   "license": "MIT",
   "signalk": {
-    "displayName": "CZone"
+    "displayName": "CZone",
+    "appIcon": "./img/czone-circuits.png",
+    "screenshots": [
+      "./img/config.png",
+      "./img/diagnostics.png",
+      "./img/grafana-example.png"
+    ]
   },
+  "author": "svSugarShack <matt@ick.com>",
+  "signalk-plugin-enabled-by-default": true,
   "engines": {
     "node": ">=20"
   },
@@ -21,6 +30,7 @@
     "index.js",
     "lib/",
     "public/",
+    "img/",
     "README.md",
     "LICENSE"
   ]
