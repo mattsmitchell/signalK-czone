@@ -18,7 +18,8 @@
     "screenshots": [
       "./img/config.png",
       "./img/diagnostics.png",
-      "./img/grafana-example.png"
+      "./img/grafana-example.png",
+      "recommends": ["@signalk/signalk-to-influxdb2"]
     ]
   },
   "author": "svSugarShack <matt@ick.com>",
