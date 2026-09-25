@@ -15,11 +15,11 @@
   "signalk": {
     "displayName": "CZone",
     "appIcon": "./img/czone-circuits.png",
+    "recommends": ["@signalk/signalk-to-influxdb2"],
     "screenshots": [
       "./img/config.png",
       "./img/diagnostics.png",
-      "./img/grafana-example.png",
-      "recommends": ["@signalk/signalk-to-influxdb2"]
+      "./img/grafana-example.png"
     ]
   },
   "author": "svSugarShack <matt@ick.com>",
